@@ -1,37 +1,65 @@
 # bot/summarize.py
 import os
-os.environ["TRANSFORMERS_NO_TF"] = "1"
-os.environ["USE_TF"] = "0"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+import requests
+import asyncio
 
-from transformers import pipeline
-
-_sum_pipe = pipeline(
-    "summarization",
-    model="sshleifer/distilbart-cnn-12-6",
-    framework="pt",
-    device=-1
-)
-
-def _len_cfg(length: str):
-    length = (length or "medium").lower()
-    if length == "short":
-        return dict(map_len=140, map_min=50, reduce_len=160, reduce_min=60)
-    if length == "long":
-        return dict(map_len=260, map_min=100, reduce_len=320, reduce_min=120)
-    return dict(map_len=220, map_min=80, reduce_len=250, reduce_min=90)
+# Hugging Face Inference API
+HF_API_URL = "https://api-inference.huggingface.co/models/sshleifer/distilbart-cnn-12-6"
 
 def _summarize_once(text: str, max_len: int, min_len: int) -> str:
+    """Call Hugging Face API for summarization."""
     text = (text or "").strip()
-    if not text:
+    if not text or len(text) < 30:
         return ""
-    out = _sum_pipe(text, max_length=max_len, min_length=min_len, do_sample=False)[0]["summary_text"]
-    return out.strip()
+    
+    # Get API key from environment
+    api_key = os.getenv("HF_TOKEN", "")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    
+    try:
+        response = requests.post(
+            HF_API_URL,
+            headers=headers,
+            json={
+                "inputs": text,
+                "parameters": {
+                    "max_length": max_len,
+                    "min_length": min_len,
+                    "do_sample": False
+                }
+            },
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                return result[0]['summary_text'].strip()
+        
+        # If API fails, return original or truncated text
+        if len(text) > 200:
+            return text[:197] + "..."
+        return text
+        
+    except Exception:
+        # Fallback if API is down
+        if len(text) > 150:
+            return text[:147] + "..."
+        return text
 
-def chunk_messages(msgs: list[str], target_chars: int = 1000) -> list[str]:
+def _len_cfg(length: str):
+    """Configure summary length parameters."""
+    length = (length or "medium").lower()
+    if length == "short":
+        return dict(map_len=120, map_min=40, reduce_len=140, reduce_min=50)
+    if length == "long":
+        return dict(map_len=200, map_min=80, reduce_len=250, reduce_min=90)
+    return dict(map_len=180, map_min=60, reduce_len=200, reduce_min=70)
+
+def chunk_messages(msgs: list[str], target_chars: int = 800) -> list[str]:
     """
-    Build chunks close to target_chars, respecting message boundaries
-    so multiple topics don't get smashed together.
+    Build chunks respecting message boundaries.
+    Smaller target for API limits.
     """
     chunks, cur, curlen = [], [], 0
     for m in msgs:
@@ -47,21 +75,43 @@ def chunk_messages(msgs: list[str], target_chars: int = 1000) -> list[str]:
 
 async def summarize_messages_hierarchical(msgs: list[str], length: str = "medium") -> str:
     """
-    Map-reduce summary over message windows, then ask the reducer to
-    explicitly cover ALL topics + produce structured output.
+    Map-reduce summary using Hugging Face API.
+    Optimized for API rate limits.
     """
+    if not msgs:
+        return "No messages to summarize."
+    
+    # If very short, summarize directly
+    total_chars = sum(len(m) for m in msgs)
+    if total_chars < 400:
+        combined = "\n".join(msgs)
+        cfg = _len_cfg(length)
+        return _summarize_once(combined, max_len=cfg["reduce_len"], min_len=cfg["reduce_min"])
+    
     cfg = _len_cfg(length)
-    # 1) map over message windows
-    chunks = chunk_messages(msgs, target_chars=1000)
+    chunks = chunk_messages(msgs, target_chars=800)
+    
+    # Process chunks with small delay to respect API limits
     partials = []
-    for ch in chunks:
-        partials.append(_summarize_once(ch, max_len=cfg["map_len"], min_len=cfg["map_min"]))
-    # 2) reduce with a stronger instruction so it keeps all themes
-    if partials:
-        # SIMPLIFIED - no verbose instructions
-        combined_summaries = "\n".join([f"- {p}" for p in partials if p.strip()])
-        reduce_prompt = f"Combine these points into one concise summary:\n{combined_summaries}"
-        final = _summarize_once(reduce_prompt, max_len=cfg["reduce_len"], min_len=cfg["reduce_min"])
-    else:
-        final = "No content to summarize."
-    return final
+    for i, ch in enumerate(chunks):
+        if ch.strip():
+            summary = _summarize_once(ch, max_len=cfg["map_len"], min_len=cfg["map_min"])
+            if summary and summary.strip():
+                partials.append(summary)
+            # Small delay between API calls
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.5)
+    
+    if not partials:
+        return "Could not generate summary."
+    
+    if len(partials) == 1:
+        return partials[0]
+    
+    # Combine partial summaries
+    combined = " ".join(partials)
+    if len(combined) > 1000:
+        combined = combined[:997] + "..."
+    
+    final = _summarize_once(combined, max_len=cfg["reduce_len"], min_len=cfg["reduce_min"])
+    return final if final else " ".join(partials[:2])  # Fallback
