@@ -6,7 +6,6 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 from transformers import pipeline
 
-# Light, fast model; you can swap to "facebook/bart-large-cnn" later
 _sum_pipe = pipeline(
     "summarization",
     model="sshleifer/distilbart-cnn-12-6",
